@@ -290,7 +290,7 @@ fn tools_json() -> Value {
         },
         {
             "name": "irc_send",
-            "description": "Send a message to a channel (e.g. #claude) or a nick. Multi-line messages are sent as one PRIVMSG per line.",
+            "description": "Send a message to a channel (e.g. #claude) or a nick. Multi-line messages are sent as one PRIVMSG per line. KEEP MESSAGES SHORT: IRC caps a line at ~450 bytes and the server kicks clients for flooding — send at most 2-3 short lines at a time, chat-style, not paragraphs. Split longer thoughts across multiple irc_send calls with pauses in between.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
