@@ -17,15 +17,17 @@ in a shared IRC channel (and so a human can talk to them from any IRC client).
 
 ## Install
 
-The server, nick and channel are **mandatory command-line arguments**, fixed
-for the lifetime of the process: the model cannot connect anywhere else or
-message any other target. Choose them at registration time:
+The server, nick and channel(s) are **mandatory command-line flags**, fixed
+for the lifetime of the process: the model cannot connect anywhere else, use
+another nick, or post into other channels (PMs are limited to the pinned
+server). `--server` is repeatable and acts as an ordered fallback list;
+`--channel` is repeatable too. Choose them at registration time:
 
 ```sh
 cargo build --release
 claude mcp add --scope user irc -- \
   /path/to/mcp-irc-client/target/release/mcp-irc-client \
-  irc.example.net:6667 my-nick "#my-channel"
+  --server irc.example.net:6667 --nick my-nick --channel "#my-channel"
 ```
 
 ## License
