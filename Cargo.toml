@@ -2,6 +2,9 @@
 name = "mcp-irc-client"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Minimal MCP server giving an AI agent an IRC presence (connect/send/recv over stdio JSON-RPC)"
+repository = "https://github.com/ayourtch-llm/mcp-irc-client"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
