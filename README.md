@@ -9,17 +9,23 @@ in a shared IRC channel (and so a human can talk to them from any IRC client).
 
 ## Tools
 
-- `irc_connect` — connect to a server as a nick, optionally joining channels; replaces any existing connection
-- `irc_send` — send a message to a channel or nick (keep messages short — IRC servers kick flooders)
+- `irc_connect` — connect to the pinned server/nick/channel; replaces any existing connection
+- `irc_send` — send a message to the pinned channel (keep messages short — IRC servers kick flooders)
 - `irc_recv` — drain received messages, optionally blocking until the next one arrives
 - `irc_status` — connection state, joined channels, queue depth, recent raw server log
 - `irc_quit` — disconnect
 
 ## Install
 
+The server, nick and channel are **mandatory command-line arguments**, fixed
+for the lifetime of the process: the model cannot connect anywhere else or
+message any other target. Choose them at registration time:
+
 ```sh
 cargo build --release
-claude mcp add --scope user irc -- /path/to/mcp-irc-client/target/release/mcp-irc-client
+claude mcp add --scope user irc -- \
+  /path/to/mcp-irc-client/target/release/mcp-irc-client \
+  irc.example.net:6667 my-nick "#my-channel"
 ```
 
 ## License

@@ -4,6 +4,32 @@
 //!
 //! Tools: irc_connect, irc_send, irc_recv (blocking poll), irc_status, irc_quit.
 //! Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout (MCP stdio).
+//!
+//! The server, nick and channel are pinned at process start via mandatory
+//! command-line arguments; the tools cannot connect anywhere else or message
+//! any other target. This keeps the model's blast radius to one channel on
+//! one server chosen by whoever registered the MCP server.
+
+struct Pinned {
+    server: String,
+    port: u16,
+    nick: String,
+    channel: String,
+}
+
+fn parse_pinned() -> Pinned {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() != 3 {
+        eprintln!("usage: mcp-irc-client <server[:port]> <nick> <#channel>");
+        eprintln!("  all three are mandatory; the tools are pinned to these values");
+        std::process::exit(2);
+    }
+    let (server, port) = match args[0].rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+        _ => (args[0].clone(), 6667),
+    };
+    Pinned { server, port, nick: args[1].clone(), channel: args[2].clone() }
+}
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -145,17 +171,11 @@ fn reader_thread(shared: Shared, stream: TcpStream) {
 
 // ---- tool implementations ----------------------------------------------------
 
-fn tool_connect(shared: &Shared, a: &Value) -> Result<String, String> {
-    let server = a["server"].as_str().ok_or("missing 'server'")?.to_string();
-    let port = a["port"].as_u64().unwrap_or(6667) as u16;
-    let nick = a["nick"].as_str().ok_or("missing 'nick'")?.to_string();
-    let channels: Vec<String> = match a["channels"].as_array() {
-        Some(v) => v
-            .iter()
-            .filter_map(|c| c.as_str().map(|s| s.to_string()))
-            .collect(),
-        None => vec![],
-    };
+fn tool_connect(shared: &Shared, pinned: &Pinned) -> Result<String, String> {
+    let server = pinned.server.clone();
+    let port = pinned.port;
+    let nick = pinned.nick.clone();
+    let channels: Vec<String> = vec![pinned.channel.clone()];
 
     let stream = TcpStream::connect((server.as_str(), port))
         .map_err(|e| format!("connect {server}:{port} failed: {e}"))?;
@@ -206,8 +226,8 @@ fn tool_connect(shared: &Shared, a: &Value) -> Result<String, String> {
     }
 }
 
-fn tool_send(shared: &Shared, a: &Value) -> Result<String, String> {
-    let target = a["target"].as_str().ok_or("missing 'target'")?;
+fn tool_send(shared: &Shared, pinned: &Pinned, a: &Value) -> Result<String, String> {
+    let target = pinned.channel.as_str();
     let message = a["message"].as_str().ok_or("missing 'message'")?;
     let (lock, _) = &**shared;
     let mut st = lock.lock().unwrap();
@@ -272,32 +292,26 @@ fn tool_quit(shared: &Shared) -> Result<String, String> {
 
 // ---- MCP plumbing ------------------------------------------------------------
 
-fn tools_json() -> Value {
+fn tools_json(pinned: &Pinned) -> Value {
     json!([
         {
             "name": "irc_connect",
-            "description": "Connect to an IRC server and optionally join channels. Replaces any existing connection.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "server": {"type": "string", "description": "IRC server hostname or IP"},
-                    "port": {"type": "number", "description": "Port (default 6667)"},
-                    "nick": {"type": "string", "description": "Nickname to use"},
-                    "channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to join, e.g. [\"#claude\"]"}
-                },
-                "required": ["server", "nick"]
-            }
+            "description": format!(
+                "Connect to the pinned IRC server {}:{} as {} and join {}. Server, nick and channel are fixed at process start and cannot be changed. Replaces any existing connection.",
+                pinned.server, pinned.port, pinned.nick, pinned.channel),
+            "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "irc_send",
-            "description": "Send a message to a channel (e.g. #claude) or a nick. Multi-line messages are sent as one PRIVMSG per line. KEEP MESSAGES SHORT: IRC caps a line at ~450 bytes and the server kicks clients for flooding — send at most 2-3 short lines at a time, chat-style, not paragraphs. Split longer thoughts across multiple irc_send calls with pauses in between.",
+            "description": format!(
+                "Send a message to the pinned channel {} (the only allowed target). Multi-line messages are sent as one PRIVMSG per line. KEEP MESSAGES SHORT: IRC caps a line at ~450 bytes and the server kicks clients for flooding — send at most 2-3 short lines at a time, chat-style, not paragraphs. Split longer thoughts across multiple irc_send calls with pauses in between.",
+                pinned.channel),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": {"type": "string", "description": "Channel or nick"},
                     "message": {"type": "string", "description": "Text to send"}
                 },
-                "required": ["target", "message"]
+                "required": ["message"]
             }
         },
         {
@@ -324,6 +338,7 @@ fn tools_json() -> Value {
 }
 
 fn main() {
+    let pinned = parse_pinned();
     let shared: Shared = Arc::new((Mutex::new(IrcState::new()), Condvar::new()));
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -357,13 +372,13 @@ fn main() {
                 })))
             }
             "ping" => Some(reply(json!({}))),
-            "tools/list" => Some(reply(json!({"tools": tools_json()}))),
+            "tools/list" => Some(reply(json!({"tools": tools_json(&pinned)}))),
             "tools/call" => {
                 let name = msg["params"]["name"].as_str().unwrap_or("");
                 let args = msg["params"]["arguments"].clone();
                 let out = match name {
-                    "irc_connect" => tool_connect(&shared, &args),
-                    "irc_send" => tool_send(&shared, &args),
+                    "irc_connect" => tool_connect(&shared, &pinned),
+                    "irc_send" => tool_send(&shared, &pinned, &args),
                     "irc_recv" => tool_recv(&shared, &args),
                     "irc_status" => tool_status(&shared),
                     "irc_quit" => tool_quit(&shared),
