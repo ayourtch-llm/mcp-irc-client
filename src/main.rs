@@ -237,14 +237,68 @@ fn tool_send(shared: &Shared, pinned: &Pinned, a: &Value) -> Result<String, Stri
         }
     }
     let message = a["message"].as_str().ok_or("missing 'message'")?;
+    // Oversized PRIVMSG lines get the whole connection killed by the server
+    // ("Request too long"), so length safety lives here, not in caller
+    // discipline: every logical line is split to fit before anything is sent.
+    let input_lines: Vec<&str> = message.lines().filter(|l| !l.trim().is_empty()).collect();
+    let chunks: Vec<String> = input_lines
+        .iter()
+        .flat_map(|l| split_privmsg(l, MAX_PRIVMSG_BYTES))
+        .collect();
+    if chunks.len() > MAX_LINES_PER_SEND {
+        return Err(format!(
+            "message would be {} IRC lines after splitting (max {MAX_LINES_PER_SEND} per send; the server kicks flooders) — send it in parts",
+            chunks.len()
+        ));
+    }
     let (lock, _) = &**shared;
     let mut st = lock.lock().unwrap();
     let mut n = 0;
-    for line in message.lines().filter(|l| !l.trim().is_empty()) {
-        send_raw(&mut st, &format!("PRIVMSG {target} :{line}"))?;
+    for chunk in &chunks {
+        send_raw(&mut st, &format!("PRIVMSG {target} :{chunk}"))?;
         n += 1;
     }
-    Ok(format!("sent {n} line(s) to {target}"))
+    if n > input_lines.len() {
+        Ok(format!(
+            "sent {n} line(s) to {target} ({} input line(s) auto-split to fit IRC's length cap)",
+            input_lines.len()
+        ))
+    } else {
+        Ok(format!("sent {n} line(s) to {target}"))
+    }
+}
+
+/// Byte budget for one PRIVMSG payload. The IRC frame cap is 512 bytes
+/// including "PRIVMSG <target> :", CRLF, and — on relay — the server-added
+/// ":nick!user@host " prefix; 400 leaves headroom for all of that.
+const MAX_PRIVMSG_BYTES: usize = 400;
+/// Ceiling on IRC lines emitted by one irc_send call, so auto-splitting a
+/// huge message can't convert a length kick into a flood kick.
+const MAX_LINES_PER_SEND: usize = 12;
+
+/// Split one logical line into chunks of at most `budget` bytes, cutting only
+/// at UTF-8 character boundaries and preferring the last whitespace in the
+/// window so words survive intact. A single over-budget word is hard-split.
+fn split_privmsg(line: &str, budget: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line.trim();
+    while rest.len() > budget {
+        let mut cut = budget;
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(sp) = rest[..cut].rfind(char::is_whitespace) {
+            if sp > 0 {
+                cut = sp;
+            }
+        }
+        out.push(rest[..cut].trim_end().to_string());
+        rest = rest[cut..].trim_start();
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
 }
 
 fn tool_recv(shared: &Shared, a: &Value) -> Result<String, String> {
@@ -312,7 +366,7 @@ fn tools_json(pinned: &Pinned) -> Value {
         },
         {
             "name": "irc_send",
-            "description": "Send a message to the pinned channel (default) or as a PM to a nick. Multi-line messages are sent as one PRIVMSG per line. KEEP MESSAGES SHORT: IRC caps a line at ~450 bytes and the server kicks clients for flooding — send at most 2-3 short lines at a time, chat-style, not paragraphs. Split longer thoughts across multiple irc_send calls with pauses in between.",
+            "description": "Send a message to the pinned channel (default) or as a PM to a nick. Multi-line messages are sent as one PRIVMSG per line; lines over IRC's length cap are auto-split at word boundaries, so oversized lines cannot kill the connection. Still KEEP MESSAGES SHORT: the server kicks clients for flooding, so send at most 2-3 short lines at a time, chat-style — a send that would exceed 12 IRC lines after splitting is rejected. Split longer thoughts across multiple irc_send calls with pauses in between.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -461,5 +515,58 @@ fn main() {
             let _ = writeln!(out, "{r}");
             let _ = out.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_privmsg;
+
+    #[test]
+    fn short_line_untouched() {
+        assert_eq!(split_privmsg("hello world", 400), vec!["hello world"]);
+    }
+
+    #[test]
+    fn splits_at_word_boundary_and_rejoins() {
+        let line = "word ".repeat(100);
+        let line = line.trim();
+        let chunks = split_privmsg(line, 400);
+        assert!(chunks.len() >= 2);
+        for c in &chunks {
+            assert!(c.len() <= 400, "chunk over budget: {} bytes", c.len());
+            assert!(!c.starts_with(' ') && !c.ends_with(' '));
+        }
+        assert_eq!(chunks.join(" "), line);
+    }
+
+    #[test]
+    fn utf8_boundary_safe() {
+        let line = "é".repeat(300); // 600 bytes of 2-byte chars, no whitespace
+        let chunks = split_privmsg(&line, 401); // odd budget forces boundary backoff
+        for c in &chunks {
+            assert!(c.len() <= 401);
+            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        }
+        assert_eq!(chunks.concat(), line);
+    }
+
+    #[test]
+    fn long_word_hard_split() {
+        let line = "a".repeat(900);
+        let chunks = split_privmsg(&line, 400);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.concat(), line);
+    }
+
+    #[test]
+    fn tiny_leading_word_converges() {
+        let mut line = String::from("a ");
+        line.push_str(&"b".repeat(900));
+        let chunks = split_privmsg(&line, 400);
+        for c in &chunks {
+            assert!(c.len() <= 400);
+        }
+        assert_eq!(chunks.join(""), line.replace(' ', ""));
     }
 }
