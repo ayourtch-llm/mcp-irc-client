@@ -272,8 +272,13 @@ fn tool_send(shared: &Shared, pinned: &Pinned, a: &Value) -> Result<String, Stri
 /// including "PRIVMSG <target> :", CRLF, and — on relay — the server-added
 /// ":nick!user@host " prefix; 400 leaves headroom for all of that.
 const MAX_PRIVMSG_BYTES: usize = 400;
-/// Ceiling on IRC lines emitted by one irc_send call, so auto-splitting a
-/// huge message can't convert a length kick into a flood kick.
+/// Ceiling on IRC lines emitted by one irc_send call. Measured against the
+/// household ngircd 26.1 (2026-08-11, stock Debian config): the server never
+/// rate-kills — an instant 800-line/123KB burst was accepted and read-throttled
+/// to ~2.6-2.9 PRIVMSG/s with zero kills — so this cap bounds self-inflicted
+/// LAG (12 lines ~= 4-5s of server drain blocking our own next send), not a
+/// kick risk. The only kill mode is a >512-byte frame ("Request too long"),
+/// which split_privmsg prevents.
 const MAX_LINES_PER_SEND: usize = 12;
 
 /// Split one logical line into chunks of at most `budget` bytes, cutting only
@@ -366,7 +371,7 @@ fn tools_json(pinned: &Pinned) -> Value {
         },
         {
             "name": "irc_send",
-            "description": "Send a message to the pinned channel (default) or as a PM to a nick. Multi-line messages are sent as one PRIVMSG per line; lines over IRC's length cap are auto-split at word boundaries, so oversized lines cannot kill the connection. Still KEEP MESSAGES SHORT: the server kicks clients for flooding, so send at most 2-3 short lines at a time, chat-style — a send that would exceed 12 IRC lines after splitting is rejected. Split longer thoughts across multiple irc_send calls with pauses in between.",
+            "description": "Send a message to the pinned channel (default) or as a PM to a nick. Multi-line messages are sent as one PRIVMSG per line; lines over IRC's length cap are auto-split at word boundaries, so oversized lines cannot kill the connection (the only server kill mode, measured 2026-08-11: a >512-byte frame). Still KEEP MESSAGES SHORT: the server processes ~3 messages/second per connection and silently queues the rest (measured), so every extra line delays your own next send and everyone's reads — a 12-line send already takes ~4s to drain, and a send that would exceed 12 IRC lines after splitting is rejected. Send 1-3 short chat-style lines; split longer thoughts across multiple irc_send calls with pauses in between, and put real substance in a file with a pointer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
