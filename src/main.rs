@@ -281,14 +281,30 @@ const MAX_PRIVMSG_BYTES: usize = 400;
 /// which split_privmsg prevents.
 const MAX_LINES_PER_SEND: usize = 12;
 
+/// Marker prepended to every auto-split continuation fragment (all chunks
+/// after the first). Receivers key on it: a "… " line from a sender is the
+/// tail of that sender's previous line, not a new message — without it,
+/// addressee-pattern inject filters silently shunt tails to backlog
+/// (a peer agent's diagnosis, 2026-08-14; ayourtch chose this design).
+pub const CONTINUATION_MARKER: &str = "… ";
+
 /// Split one logical line into chunks of at most `budget` bytes, cutting only
 /// at UTF-8 character boundaries and preferring the last whitespace in the
 /// window so words survive intact. A single over-budget word is hard-split.
+/// Continuation chunks carry CONTINUATION_MARKER (inside the same budget).
 fn split_privmsg(line: &str, budget: usize) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut rest = line.trim();
-    while rest.len() > budget {
-        let mut cut = budget;
+    loop {
+        let marker = if out.is_empty() { "" } else { CONTINUATION_MARKER };
+        let b = budget.saturating_sub(marker.len()).max(1);
+        if rest.len() <= b {
+            if !rest.is_empty() {
+                out.push(format!("{marker}{rest}"));
+            }
+            break;
+        }
+        let mut cut = b;
         while !rest.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -297,11 +313,8 @@ fn split_privmsg(line: &str, budget: usize) -> Vec<String> {
                 cut = sp;
             }
         }
-        out.push(rest[..cut].trim_end().to_string());
+        out.push(format!("{marker}{}", rest[..cut].trim_end()));
         rest = rest[cut..].trim_start();
-    }
-    if !rest.is_empty() {
-        out.push(rest.to_string());
     }
     out
 }
@@ -371,7 +384,7 @@ fn tools_json(pinned: &Pinned) -> Value {
         },
         {
             "name": "irc_send",
-            "description": "Send a message to the pinned channel (default) or as a PM to a nick. Multi-line messages are sent as one PRIVMSG per line; lines over IRC's length cap are auto-split at word boundaries, so oversized lines cannot kill the connection (the only server kill mode, measured 2026-08-11: a >512-byte frame). Still KEEP MESSAGES SHORT: the server processes ~3 messages/second per connection and silently queues the rest (measured), so every extra line delays your own next send and everyone's reads — a 12-line send already takes ~4s to drain, and a send that would exceed 12 IRC lines after splitting is rejected. Send 1-3 short chat-style lines; split longer thoughts across multiple irc_send calls with pauses in between, and put real substance in a file with a pointer.",
+            "description": "Send a message to the pinned channel (default) or as a PM to a nick. Multi-line messages are sent as one PRIVMSG per line; lines over IRC's length cap are auto-split at word boundaries (continuation fragments carry a leading \"… \" so receiving inject filters can attach them to their first fragment), so oversized lines cannot kill the connection (the only server kill mode, measured 2026-08-11: a >512-byte frame). Still KEEP MESSAGES SHORT: the server processes ~3 messages/second per connection and silently queues the rest (measured), so every extra line delays your own next send and everyone's reads — a 12-line send already takes ~4s to drain, and a send that would exceed 12 IRC lines after splitting is rejected. Send 1-3 short chat-style lines; split longer thoughts across multiple irc_send calls with pauses in between, and put real substance in a file with a pointer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -525,7 +538,30 @@ fn main() {
 
 #[cfg(test)]
 mod split_tests {
-    use super::split_privmsg;
+    use super::{split_privmsg, CONTINUATION_MARKER};
+
+    /// Chunks with continuation markers stripped, for reassembly checks.
+    fn stripped(chunks: &[String]) -> Vec<String> {
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    assert!(
+                        !c.starts_with(CONTINUATION_MARKER),
+                        "first chunk must not carry the marker"
+                    );
+                    c.clone()
+                } else {
+                    assert!(
+                        c.starts_with(CONTINUATION_MARKER),
+                        "continuation chunk missing marker: {c}"
+                    );
+                    c[CONTINUATION_MARKER.len()..].to_string()
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn short_line_untouched() {
@@ -542,7 +578,7 @@ mod split_tests {
             assert!(c.len() <= 400, "chunk over budget: {} bytes", c.len());
             assert!(!c.starts_with(' ') && !c.ends_with(' '));
         }
-        assert_eq!(chunks.join(" "), line);
+        assert_eq!(stripped(&chunks).join(" "), line);
     }
 
     #[test]
@@ -553,7 +589,7 @@ mod split_tests {
             assert!(c.len() <= 401);
             assert!(std::str::from_utf8(c.as_bytes()).is_ok());
         }
-        assert_eq!(chunks.concat(), line);
+        assert_eq!(stripped(&chunks).concat(), line);
     }
 
     #[test]
@@ -561,7 +597,7 @@ mod split_tests {
         let line = "a".repeat(900);
         let chunks = split_privmsg(&line, 400);
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks.concat(), line);
+        assert_eq!(stripped(&chunks).concat(), line);
     }
 
     #[test]
@@ -572,6 +608,18 @@ mod split_tests {
         for c in &chunks {
             assert!(c.len() <= 400);
         }
-        assert_eq!(chunks.join(""), line.replace(' ', ""));
+        assert_eq!(stripped(&chunks).join(""), line.replace(' ', ""));
+    }
+
+    #[test]
+    fn continuation_marker_only_on_tails() {
+        let line = "claude-helper: first part of a long thought ".repeat(20);
+        let chunks = split_privmsg(line.trim(), 400);
+        assert!(chunks.len() >= 2);
+        let _ = stripped(&chunks); // asserts marker layout
+        // marker bytes count toward the budget, never past it
+        for c in &chunks {
+            assert!(c.len() <= 400);
+        }
     }
 }
